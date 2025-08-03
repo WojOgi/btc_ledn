@@ -1,1 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ledn Buy‑Borrow Simulator</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Helvetica, Arial,
+          sans-serif;
+        margin: 0;
+        padding: 1.25rem 2rem;
+        background: #f9fafb;
+        color: #111827;
+      }
+      h1 {
+        font-size: 1.7rem;
+        margin-bottom: 1rem;
+      }
+      .field {
+        margin-bottom: 0.85rem;
+      }
+      label {
+        display: inline-block;
+        font-weight: 600;
+        margin-bottom: 0.25rem;
+      }
+      input {
+        padding: 0.45rem 0.65rem;
+        border: 1px solid #cbd5e1;
+        border-radius: 4px;
+        width: 180px;
+      }
+      button {
+        cursor: pointer;
+        background: #2563eb;
+        color: #fff;
+        border: none;
+        padding: 0.55rem 1.15rem;
+        border-radius: 4px;
+        font-weight: 600;
+      }
+      button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        margin-top: 1.25rem;
+        font-size: 0.95rem;
+      }
+      th,
+      td {
+        padding: 0.55rem 0.7rem;
+        border: 1px solid #e2e8f0;
+        text-align: right;
+        vertical-align: top;
+      }
+      th {
+        background: #f1f5f9;
+      }
+      .loan-list {
+        text-align: left;
+        line-height: 1.35;
+      }
+      .error {
+        color: #b91c1c;
+        margin-top: 0.6rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Ledn Buy‑Borrow Simulator (5‑Year Ladder)</h1>
+    <div class="field">
+      <label for="collateralBtc">BTC collateral (units of BTC):</label><br />
+      <input
+        id="collateralBtc"
+        type="number"
+        min="0"
+        step="0.0001"
+        value="0.5"
+      />
+    </div>
+    <div class="field">
+      <label for="loanAmount">Desired loan per year (USD):</label><br />
+      <input id="loanAmount" type="number" min="1" step="100" value="12000" />
+    </div>
+    <div class="field">
+      <label for="cagr">Expected BTC CAGR (%):</label><br />
+      <input id="cagr" type="number" min="0" step="0.1" value="45" />
+    </div>
+    <div class="field">
+      <label for="waitYears">Years to wait before first loan:</label><br />
+      <input id="waitYears" type="number" min="0" step="1" value="0" />
+    </div>
+    <button id="runBtn">Run 5‑Year Simulation</button>
+    <span id="loading" style="margin-left: 12px; display: none"
+      >⏳ Fetching BTC price…</span
+    >
+    <div id="error" class="error"></div>
+    <div id="results"></div>
+
+    <script>
+      (async function () {
+        const priceAPI =
+          "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd";
+        const BTN = document.getElementById("runBtn");
+        const ERR = document.getElementById("error");
+        const RES = document.getElementById("results");
+        const LOAD = document.getElementById("loading");
+
+        BTN.addEventListener("click", async () => {
+          ERR.textContent = "";
+          RES.innerHTML = "";
+          const collateralBtc = parseFloat(
+            document.getElementById("collateralBtc").value
+          );
+          const loanUsd = parseFloat(
+            document.getElementById("loanAmount").value
+          );
+          const cagr = parseFloat(document.getElementById("cagr").value) / 100;
+          const waitYears = parseInt(
+            document.getElementById("waitYears").value || 0,
+            10
+          );
+          if (collateralBtc <= 0 || loanUsd <= 0 || cagr < 0 || waitYears < 0) {
+            ERR.textContent = "Fill all inputs with valid positive numbers.";
+            return;
+          }
+
+          BTN.disabled = true;
+          LOAD.style.display = "inline-block";
+          let price;
+          try {
+            const r = await fetch(priceAPI);
+            if (!r.ok) throw new Error("HTTP");
+            const d = await r.json();
+            price = d.bitcoin.usd;
+          } catch (e) {
+            price = 110000;
+            console.warn("Price fetch failed – using fallback", e);
+          } // fallback rate
+          BTN.disabled = false;
+          LOAD.style.display = "none";
+
+          // Ledn constants
+          const MAX_LTV = 0.5,
+            REDEEM_LTV = 0.3,
+            TARGET_LTV = 0.4;
+
+          let yearPrice = price;
+          let spareBtc = collateralBtc; // unpledged collateral pool (stays constant unless you simulate new deposits)
+          const loans = []; // active Dollar Loans [{principal, btc, openedYear}]
+          const rows = [];
+          const totalYears = waitYears + 5;
+
+          for (let y = 0; y <= totalYears; y++) {
+            /* ---------- growth for upcoming year ---------- */
+            if (y > 0) {
+              // price appreciation each new calendar year
+              yearPrice *= 1 + cagr;
+            }
+
+            /* ---------- Redemption phase (use new price) ---------- */
+            let redeemed = 0;
+            loans.forEach((l) => {
+              const ltvNow = l.principal / (l.btc * yearPrice);
+              if (ltvNow < REDEEM_LTV) {
+                const btcAfter = l.principal / (TARGET_LTV * yearPrice);
+                redeemed += l.btc - btcAfter;
+                l.btc = btcAfter;
+              }
+            });
+            spareBtc += redeemed;
+
+            /* ---------- Origination phase ---------- */
+            if (y >= waitYears) {
+              const btcNeeded = (loanUsd * 2) / yearPrice; // 50% LTV requirement
+              if (spareBtc >= btcNeeded) {
+                loans.push({ principal: loanUsd, btc: btcNeeded, opened: y });
+                spareBtc -= btcNeeded;
+              }
+            }
+
+            /* ---------- Snapshot for table ---------- */
+            const debt = loans.reduce((s, l) => s + l.principal, 0);
+            const pledgedBtc = loans.reduce((s, l) => s + l.btc, 0);
+            const totalBtc = pledgedBtc + spareBtc;
+            const pledgedUsd = pledgedBtc * yearPrice;
+            const overallLtv = debt > 0 ? debt / pledgedUsd : 0;
+
+            const loanDetails = loans
+              .map(
+                (l, i) =>
+                  `L${
+                    i + 1
+                  }: $${l.principal.toLocaleString()} | ${l.btc.toFixed(
+                    4
+                  )} BTC | ${(
+                    (l.principal / (l.btc * yearPrice)) *
+                    100
+                  ).toFixed(1)}%`
+              )
+              .join("<br>");
+
+            rows.push({
+              year: y,
+              price: yearPrice,
+              loans: loans.length,
+              loanList: loanDetails || "—",
+              debt,
+              pledgedBtc,
+              spareBtc,
+              totalBtc,
+              pledgedUsd,
+              ltv: overallLtv,
+            });
+          }
+
+          /* ---------- Render table ---------- */
+          const tbl = document.createElement("table");
+          tbl.innerHTML =
+            `<thead><tr><th style='text-align:left'>Year</th><th>BTC Price</th><th>Loans ◄details</th><th>Total Debt</th><th>Pledged BTC</th><th>Spare BTC</th><th>Total BTC</th><th>Pledged $</th><th>Overall LTV</th></tr></thead>` +
+            "<tbody>" +
+            rows
+              .map(
+                (r) =>
+                  `<tr><td style='text-align:left'>${
+                    r.year
+                  }</td><td>${r.price.toLocaleString(undefined, {
+                    maximumFractionDigits: 0,
+                  })}</td><td class='loan-list'>${
+                    r.loanList
+                  }</td><td>${r.debt.toLocaleString()}</td><td>${r.pledgedBtc.toFixed(
+                    4
+                  )}</td><td>${r.spareBtc.toFixed(
+                    4
+                  )}</td><td>${r.totalBtc.toFixed(
+                    4
+                  )}</td><td>${r.pledgedUsd.toLocaleString(undefined, {
+                    maximumFractionDigits: 0,
+                  })}</td><td>${(r.ltv * 100).toFixed(1)}%</td></tr>`
+              )
+              .join("") +
+            "</tbody>";
+
+          RES.appendChild(tbl);
+        });
+      })();
+    </script>
+  </body>
+</html>
 
